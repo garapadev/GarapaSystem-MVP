@@ -1,18 +1,41 @@
-import NextAuth from 'next-auth'
-import CredentialsProvider from 'next-auth/providers/credentials'
-import { PrismaClient } from '@prisma/client'
-import bcrypt from 'bcryptjs'
-import { getUserPermissions } from './permissions'
+import { NextAuthConfig } from "next-auth"
+import { PrismaAdapter } from "@auth/prisma-adapter"
+import CredentialsProvider from "next-auth/providers/credentials"
+import bcrypt from "bcryptjs"
+import { prisma } from "@/lib/prisma"
+import { getUserPermissions } from "@/lib/permissions"
 
-const prisma = new PrismaClient()
+declare module "next-auth" {
+  interface Session {
+    user: {
+      id: string
+      name?: string | null
+      email?: string | null
+      image?: string | null
+      employeeId?: string | null
+      permissions?: string[]
+    }
+  }
 
-export const authOptions = {
+  interface User {
+    employeeId?: string | null
+    permissions?: string[]
+  }
+
+  interface JWT {
+    employeeId?: string | null
+    permissions?: string[]
+  }
+}
+
+export const authConfig: NextAuthConfig = {
+  adapter: PrismaAdapter(prisma),
   providers: [
     CredentialsProvider({
-      name: 'credentials',
+      name: "credentials",
       credentials: {
-        email: { label: 'Email', type: 'email' },
-        password: { label: 'Password', type: 'password' }
+        email: { label: "Email", type: "email" },
+        password: { label: "Senha", type: "password" }
       },
       async authorize(credentials) {
         if (!credentials?.email || !credentials?.password) {
@@ -20,23 +43,16 @@ export const authOptions = {
         }
 
         try {
-          // Buscar usuário no banco
           const user = await prisma.user.findUnique({
-            where: {
-              email: credentials.email
-            },
+            where: { email: credentials.email as string },
             include: {
               employee: {
                 include: {
-                  groups: {
+                  permissionGroup: {
                     include: {
-                      group: {
+                      permissions: {
                         include: {
-                          permissions: {
-                            include: {
-                              permission: true
-                            }
-                          }
+                          permission: true
                         }
                       }
                     }
@@ -46,13 +62,12 @@ export const authOptions = {
             }
           })
 
-          if (!user) {
+          if (!user || !user.password) {
             return null
           }
 
-          // Verificar senha
           const isPasswordValid = await bcrypt.compare(
-            credentials.password,
+            credentials.password as string,
             user.password
           )
 
@@ -60,54 +75,48 @@ export const authOptions = {
             return null
           }
 
-          // Verificar se usuário está ativo
-          if (!user.isActive) {
-            return null
-          }
-
-          // Buscar permissões do usuário
+          // Get user permissions
           const permissions = await getUserPermissions(user.id)
 
           return {
             id: user.id,
-            email: user.email,
             name: user.name,
+            email: user.email,
             image: user.image,
-            employee: user.employee,
+            employeeId: user.employee?.id || null,
             permissions
           }
         } catch (error) {
-          console.error('Erro na autenticação:', error)
+          console.error("Erro na autenticação:", error)
           return null
         }
       }
     })
   ],
   callbacks: {
-    async session({ session, token }) {
-      if (token) {
-        session.user.id = token.id
-        session.user.employee = token.employee
-        session.user.permissions = token.permissions
-      }
-      return session
-    },
     async jwt({ token, user }) {
       if (user) {
-        token.id = user.id
-        token.employee = user.employee
+        token.employeeId = user.employeeId
         token.permissions = user.permissions
       }
       return token
+    },
+    async session({ session, token }) {
+      if (session.user) {
+        session.user.id = token.sub!
+        session.user.employeeId = token.employeeId as string | null
+        session.user.permissions = token.permissions as string[]
+      }
+      return session
     }
   },
   pages: {
-    signIn: '/auth/signin',
-    error: '/auth/error'
+    signIn: "/auth/signin",
+    signOut: "/auth/signout",
+    error: "/auth/error"
   },
   session: {
-    strategy: 'jwt'
-  }
+    strategy: "jwt"
+  },
+  secret: process.env.NEXTAUTH_SECRET
 }
-
-export default NextAuth(authOptions)

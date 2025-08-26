@@ -1,25 +1,17 @@
-import { PrismaClient } from '@prisma/client'
-import { useSession } from 'next-auth/react'
+import { prisma } from "./prisma"
 
-const prisma = new PrismaClient()
-
-// Função para buscar permissões de um usuário
-export async function getUserPermissions(userId: string) {
+export async function getUserPermissions(userId: string): Promise<string[]> {
   try {
     const user = await prisma.user.findUnique({
       where: { id: userId },
       include: {
         employee: {
           include: {
-            groups: {
+            permissionGroup: {
               include: {
-                group: {
+                permissions: {
                   include: {
-                    permissions: {
-                      include: {
-                        permission: true
-                      }
-                    }
+                    permission: true
                   }
                 }
               }
@@ -29,66 +21,38 @@ export async function getUserPermissions(userId: string) {
       }
     })
 
-    if (!user?.employee) {
+    if (!user?.employee?.permissionGroup) {
       return []
     }
 
-    // Coletar todas as permissões dos grupos do usuário
-    const permissions: Array<{
-      resource: string
-      action: string
-    }> = []
-
-    user.employee.groups.forEach(employeeGroup => {
-      employeeGroup.group.permissions.forEach(groupPermission => {
-        permissions.push({
-          resource: groupPermission.permission.resource,
-          action: groupPermission.permission.action
-        })
-      })
-    })
-
-    // Remover duplicatas
-    const uniquePermissions = permissions.filter((permission, index, self) => 
-      index === self.findIndex(p => 
-        p.resource === permission.resource && p.action === permission.action
-      )
+    return user.employee.permissionGroup.permissions.map(
+      (pg) => `${pg.permission.resource}:${pg.permission.action}`
     )
-
-    return uniquePermissions
   } catch (error) {
-    console.error('Erro ao buscar permissões do usuário:', error)
+    console.error("Erro ao buscar permissões:", error)
     return []
   }
 }
 
-// Função para verificar se usuário tem uma permissão específica
-export async function hasPermission(
-  userId: string, 
-  resource: string, 
-  action: string
-): Promise<boolean> {
-  try {
-    const permissions = await getUserPermissions(userId)
-    return permissions.some(p => p.resource === resource && p.action === action)
-  } catch (error) {
-    console.error('Erro ao verificar permissão:', error)
-    return false
-  }
+export function hasPermission(userPermissions: string[], resource: string, action: string): boolean {
+  const requiredPermission = `${resource}:${action}`
+  const allPermission = `*:*`
+  const resourceAllPermission = `${resource}:*`
+  
+  return userPermissions.includes(requiredPermission) || 
+         userPermissions.includes(allPermission) ||
+         userPermissions.includes(resourceAllPermission)
 }
 
-// Hook para usar permissões no frontend
+export function checkPermission(userPermissions: string[] | undefined, resource: string, action: string): boolean {
+  if (!userPermissions) return false
+  return hasPermission(userPermissions, resource, action)
+}
+
+// Hook para usar em componentes
 export function usePermissions() {
-  const { data: session } = useSession()
-  
-  const permissions = session?.user?.permissions || []
-  
-  const hasPermission = (resource: string, action: string) => {
-    return permissions.some((p: any) => p.resource === resource && p.action === action)
-  }
-  
   return {
-    permissions,
-    hasPermission
+    hasPermission,
+    checkPermission
   }
 }
