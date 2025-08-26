@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: garapa-postgres
+    environment:
+      POSTGRES_DB: crm_mvp
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init:/docker-entrypoint-initdb.d
+    networks:
+      - garapa-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: garapa-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - garapa-network
+
+volumes:
+  postgres_data:
+
+networks:
+  garapa-network:
+    driver: bridge
