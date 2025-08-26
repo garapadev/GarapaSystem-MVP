@@ -111,7 +111,7 @@ cd GarapaSystem-MVP
 
 ### 2. **Instale as dependências**
 ```bash
-npm install
+npm install --legacy-peer-deps
 ```
 
 ### 3. **Configure o banco de dados**
