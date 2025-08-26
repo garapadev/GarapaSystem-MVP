@@ -1,189 +1,260 @@
-#!/usr/bin/env node
-
-const { PrismaClient } = require('@prisma/client')
 const Imap = require('node-imap')
 const { simpleParser } = require('mailparser')
+const { PrismaClient } = require('@prisma/client')
 
 const prisma = new PrismaClient()
 
+// Worker para sincronização de emails
 class EmailSyncWorker {
   constructor() {
     this.isRunning = false
-    this.interval = null
-    this.syncInterval = 300000 // 5 minutos
+    this.syncInterval = null
+    this.batchSize = 10 // Processar 10 contas por vez
+    this.syncIntervalMs = 5 * 60 * 1000 // 5 minutos
   }
 
-  start() {
-    console.log('📧 Email Sync Worker iniciado')
-    this.isRunning = true
-    
-    // Sincronização inicial
-    this.syncAllAccounts()
-    
-    // Sincronização periódica
-    this.interval = setInterval(() => {
-      this.syncAllAccounts()
-    }, this.syncInterval)
-  }
-
-  stop() {
-    console.log('⏹️ Parando Email Sync Worker...')
-    this.isRunning = false
-    if (this.interval) {
-      clearInterval(this.interval)
+  // Iniciar o worker
+  async start() {
+    if (this.isRunning) {
+      console.log('Email sync worker já está rodando')
+      return
     }
+
+    this.isRunning = true
+    console.log('Iniciando email sync worker...')
+
+    // Executar sincronização imediatamente
+    await this.syncAllAccounts()
+
+    // Configurar intervalo de sincronização
+    this.syncInterval = setInterval(async () => {
+      await this.syncAllAccounts()
+    }, this.syncIntervalMs)
+
+    console.log(`Email sync worker iniciado. Sincronizando a cada ${this.syncIntervalMs / 1000} segundos.`)
   }
 
+  // Parar o worker
+  async stop() {
+    if (!this.isRunning) {
+      console.log('Email sync worker não está rodando')
+      return
+    }
+
+    this.isRunning = false
+    
+    if (this.syncInterval) {
+      clearInterval(this.syncInterval)
+      this.syncInterval = null
+    }
+
+    await prisma.$disconnect()
+    console.log('Email sync worker parado')
+  }
+
+  // Sincronizar todas as contas ativas
   async syncAllAccounts() {
     try {
-      // Buscar todas as contas de email ativas
-      const emailAccounts = await prisma.emailAccount.findMany({
+      console.log('Iniciando sincronização de contas de email...')
+      
+      // Buscar contas ativas
+      const accounts = await prisma.emailAccount.findMany({
         where: {
-          isActive: true,
-          type: 'IMAP' // Por enquanto, apenas IMAP
-        },
-        include: {
-          employee: {
-            select: {
-              id: true,
-              firstName: true,
-              lastName: true,
-              email: true
-            }
-          }
+          isActive: true
         }
       })
 
-      if (emailAccounts.length === 0) {
-        console.log('📭 Nenhuma conta de email ativa encontrada')
+      if (accounts.length === 0) {
+        console.log('Nenhuma conta de email ativa encontrada')
         return
       }
 
-      console.log(`📬 Sincronizando ${emailAccounts.length} contas de email...`)
+      console.log(`Encontradas ${accounts.length} contas ativas para sincronização`)
 
-      // Sincronizar contas em paralelo (mas limitado para não sobrecarregar)
-      const batchSize = 3 // Máximo 3 contas simultâneas
-      for (let i = 0; i < emailAccounts.length; i += batchSize) {
-        const batch = emailAccounts.slice(i, i + batchSize)
-        const promises = batch.map(account => this.syncAccount(account))
-        await Promise.allSettled(promises)
+      // Processar contas em lotes
+      for (let i = 0; i < accounts.length; i += this.batchSize) {
+        const batch = accounts.slice(i, i + this.batchSize)
+        await this.processBatch(batch)
+        
+        // Pequena pausa entre lotes para não sobrecarregar
+        if (i + this.batchSize < accounts.length) {
+          await new Promise(resolve => setTimeout(resolve, 1000))
+        }
       }
 
+      console.log('Sincronização de contas concluída')
     } catch (error) {
-      console.error('❌ Erro na sincronização geral:', error)
+      console.error('Erro na sincronização de contas:', error)
     }
   }
 
-  async syncAccount(emailAccount) {
-    console.log(`📥 Sincronizando conta: ${emailAccount.email}`)
-    
-    return new Promise((resolve) => {
+  // Processar um lote de contas
+  async processBatch(accounts) {
+    const promises = accounts.map(account => this.syncAccount(account))
+    await Promise.allSettled(promises)
+  }
+
+  // Sincronizar uma conta específica
+  async syncAccount(account) {
+    try {
+      console.log(`Sincronizando conta: ${account.email}`)
+      
       const imapConfig = {
-        user: emailAccount.username,
-        password: emailAccount.password,
-        host: emailAccount.imapHost,
-        port: emailAccount.imapPort,
-        tls: emailAccount.imapSecure,
+        user: account.username,
+        password: account.password,
+        host: account.imapHost,
+        port: account.imapPort,
+        tls: account.imapSecure,
         connTimeout: 60000,
-        authTimeout: 30000,
-        keepalive: false
+        authTimeout: 3000,
+        tlsOptions: { rejectUnauthorized: false }
       }
 
-      const imap = new Imap(imapConfig)
-      let processed = 0
+      await this.syncImapAccount(account, imapConfig)
+      
+      // Atualizar última sincronização
+      await prisma.emailAccount.update({
+        where: { id: account.id },
+        data: { lastSyncAt: new Date() }
+      })
 
+      console.log(`Conta ${account.email} sincronizada com sucesso`)
+    } catch (error) {
+      console.error(`Erro ao sincronizar conta ${account.email}:`, error)
+      
+      // Registrar erro no banco
+      await prisma.emailAccount.update({
+        where: { id: account.id },
+        data: { 
+          lastSyncAt: new Date(),
+          lastError: error.message
+        }
+      })
+    }
+  }
+
+  // Sincronizar conta IMAP
+  async syncImapAccount(account, imapConfig) {
+    return new Promise((resolve, reject) => {
+      const imap = new Imap(imapConfig)
+      
       imap.once('ready', () => {
-        imap.openBox('INBOX', true, (err, box) => {
+        imap.openBox('INBOX', false, async (err, box) => {
           if (err) {
-            console.error(`❌ Erro ao abrir INBOX para ${emailAccount.email}:`, err.message)
-            imap.end()
-            return resolve()
+            reject(err)
+            return
           }
 
-          // Buscar emails dos últimos 7 dias que ainda não foram sincronizados
-          const sevenDaysAgo = new Date()
-          sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7)
-          
-          const searchCriteria = [
-            'UNSEEN', // Apenas não lidos para otimizar
-            ['SINCE', sevenDaysAgo]
-          ]
+          try {
+            // Buscar emails não sincronizados
+            const searchCriteria = ['UNSEEN'] // Apenas não lidos
+            
+            imap.search(searchCriteria, async (err, results) => {
+              if (err) {
+                reject(err)
+                return
+              }
 
-          imap.search(searchCriteria, (err, results) => {
-            if (err) {
-              console.error(`❌ Erro na busca para ${emailAccount.email}:`, err.message)
+              if (!results || results.length === 0) {
+                imap.end()
+                resolve()
+                return
+              }
+
+              console.log(`Encontrados ${results.length} emails novos para ${account.email}`)
+              
+              // Processar emails em lotes menores
+              const emailBatchSize = 5
+              for (let i = 0; i < results.length; i += emailBatchSize) {
+                const emailBatch = results.slice(i, i + emailBatchSize)
+                await this.processEmailBatch(imap, emailBatch, account)
+              }
+
               imap.end()
-              return resolve()
-            }
-
-            if (!results || results.length === 0) {
-              console.log(`📭 Nenhum email novo para ${emailAccount.email}`)
-              imap.end()
-              return resolve()
-            }
-
-            console.log(`📮 Encontrados ${results.length} emails novos para ${emailAccount.email}`)
-
-            const fetch = imap.fetch(results, {
-              bodies: '',
-              struct: true,
-              markSeen: false
+              resolve()
             })
-
-            fetch.on('message', (msg, seqno) => {
-              let emailBuffer = Buffer.alloc(0)
-
-              msg.on('body', (stream) => {
-                stream.on('data', (chunk) => {
-                  emailBuffer = Buffer.concat([emailBuffer, chunk])
-                })
-              })
-
-              msg.once('end', async () => {
-                try {
-                  const parsed = await simpleParser(emailBuffer)
-                  await this.saveEmail(emailAccount, parsed)
-                  processed++
-                } catch (error) {
-                  console.error(`❌ Erro ao processar email ${seqno}:`, error.message)
-                }
-              })
-            })
-
-            fetch.once('error', (err) => {
-              console.error(`❌ Erro no fetch para ${emailAccount.email}:`, err.message)
-            })
-
-            fetch.once('end', () => {
-              console.log(`✅ Processados ${processed} emails para ${emailAccount.email}`)
-              imap.end()
-            })
-          })
+          } catch (error) {
+            imap.end()
+            reject(error)
+          }
         })
       })
 
       imap.once('error', (err) => {
-        console.error(`❌ Erro IMAP para ${emailAccount.email}:`, err.message)
-        resolve()
-      })
-
-      imap.once('end', () => {
-        resolve()
+        reject(err)
       })
 
       imap.connect()
     })
   }
 
-  async saveEmail(emailAccount, parsed) {
-    try {
-      // Verificar se email já existe
-      const existingEmail = await prisma.email.findUnique({
-        where: {
-          emailAccountId_messageId: {
-            emailAccountId: emailAccount.id,
-            messageId: parsed.messageId || `${parsed.subject}-${parsed.date?.getTime()}`
+  // Processar lote de emails
+  async processEmailBatch(imap, emailIds, account) {
+    return new Promise((resolve, reject) => {
+      const fetch = imap.fetch(emailIds, {
+        bodies: '',
+        struct: true,
+        markSeen: false
+      })
+
+      const emails = []
+      
+      fetch.on('message', (msg, seqno) => {
+        let buffer = ''
+        let attributes = null
+
+        msg.on('body', (stream, info) => {
+          stream.on('data', (chunk) => {
+            buffer += chunk.toString('utf8')
+          })
+        })
+
+        msg.once('attributes', (attrs) => {
+          attributes = attrs
+        })
+
+        msg.once('end', async () => {
+          try {
+            const parsed = await simpleParser(buffer)
+            emails.push({
+              parsed,
+              attributes,
+              accountId: account.id
+            })
+          } catch (error) {
+            console.error('Erro ao parsear email:', error)
           }
+        })
+      })
+
+      fetch.once('error', (err) => {
+        reject(err)
+      })
+
+      fetch.once('end', async () => {
+        try {
+          // Salvar emails no banco
+          for (const emailData of emails) {
+            await this.saveEmail(emailData)
+          }
+          resolve()
+        } catch (error) {
+          reject(error)
+        }
+      })
+    })
+  }
+
+  // Salvar email no banco de dados
+  async saveEmail(emailData) {
+    try {
+      const { parsed, attributes, accountId } = emailData
+      
+      // Verificar se email já existe
+      const existingEmail = await prisma.email.findFirst({
+        where: {
+          messageId: parsed.messageId,
+          accountId: accountId
         }
       })
 
@@ -191,111 +262,61 @@ class EmailSyncWorker {
         return // Email já existe
       }
 
-      // Preparar dados do email
-      const emailData = {
-        messageId: parsed.messageId || `${parsed.subject}-${parsed.date?.getTime()}`,
-        subject: parsed.subject || 'Sem assunto',
-        fromAddress: parsed.from?.value?.[0]?.address || '',
-        fromName: parsed.from?.value?.[0]?.name || null,
-        toAddresses: parsed.to?.value?.map(addr => addr.address) || [],
-        ccAddresses: parsed.cc?.value?.map(addr => addr.address) || [],
-        bccAddresses: parsed.bcc?.value?.map(addr => addr.address) || [],
-        bodyText: parsed.text || null,
-        bodyHtml: parsed.html || null,
-        isRead: false,
-        isStarred: false,
-        hasAttachments: (parsed.attachments && parsed.attachments.length > 0),
-        receivedAt: parsed.date || new Date(),
-        emailAccountId: emailAccount.id,
-        folder: 'INBOX'
-      }
-
-      // Salvar email
-      const savedEmail = await prisma.email.create({
-        data: emailData
-      })
-
-      // Salvar anexos se existirem
-      if (parsed.attachments && parsed.attachments.length > 0) {
-        const attachments = parsed.attachments.map(attachment => ({
-          emailId: savedEmail.id,
-          filename: attachment.filename || 'anexo',
-          contentType: attachment.contentType || 'application/octet-stream',
-          size: attachment.size || 0,
-          content: attachment.content || Buffer.alloc(0)
-        }))
-
-        await prisma.emailAttachment.createMany({
-          data: attachments
-        })
-      }
-
-      console.log(`💾 Email salvo: ${parsed.subject} (${emailAccount.email})`)
-
-      // Disparar webhook se configurado
-      try {
-        const { WebhookService } = require('../lib/webhook-service')
-        await WebhookService.triggerEmailReceived(savedEmail)
-      } catch (webhookError) {
-        console.error('❌ Erro ao disparar webhook:', webhookError.message)
-        // Não falhar a sincronização por erro no webhook
-      }
-
-    } catch (error) {
-      console.error('❌ Erro ao salvar email:', error.message)
-    }
-  }
-
-  async cleanup() {
-    try {
-      // Limpar emails antigos (mais de 90 dias) se necessário
-      const ninetyDaysAgo = new Date()
-      ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90)
-
-      // Por enquanto, apenas log - não excluir automaticamente
-      const oldEmailsCount = await prisma.email.count({
-        where: {
-          receivedAt: {
-            lt: ninetyDaysAgo
-          }
+      // Criar novo email
+      await prisma.email.create({
+        data: {
+          messageId: parsed.messageId || `${Date.now()}-${Math.random()}`,
+          subject: parsed.subject || 'Sem assunto',
+          fromAddress: parsed.from?.value?.[0]?.address || '',
+          fromName: parsed.from?.value?.[0]?.name || '',
+          toAddresses: parsed.to?.value?.map(addr => addr.address) || [],
+          ccAddresses: parsed.cc?.value?.map(addr => addr.address) || [],
+          bccAddresses: parsed.bcc?.value?.map(addr => addr.address) || [],
+          textBody: parsed.text || '',
+          htmlBody: parsed.html || '',
+          receivedAt: parsed.date || new Date(),
+          isRead: attributes?.flags?.includes('\\Seen') || false,
+          isStarred: attributes?.flags?.includes('\\Flagged') || false,
+          folder: 'INBOX',
+          accountId: accountId,
+          attachments: parsed.attachments?.map(att => ({
+            filename: att.filename || 'attachment',
+            contentType: att.contentType || 'application/octet-stream',
+            size: att.size || 0,
+            content: att.content || Buffer.alloc(0)
+          })) || []
         }
       })
 
-      if (oldEmailsCount > 0) {
-        console.log(`📊 Existem ${oldEmailsCount} emails com mais de 90 dias`)
-      }
-
+      console.log(`Email salvo: ${parsed.subject}`)
     } catch (error) {
-      console.error('❌ Erro na limpeza:', error)
+      console.error('Erro ao salvar email:', error)
     }
   }
 }
 
-// Inicializar worker
-const worker = new EmailSyncWorker()
+// Inicializar worker se executado diretamente
+if (require.main === module) {
+  const worker = new EmailSyncWorker()
+  
+  // Graceful shutdown
+  process.on('SIGINT', async () => {
+    console.log('Recebido SIGINT, parando worker...')
+    await worker.stop()
+    process.exit(0)
+  })
 
-// Limpeza diária
-setInterval(() => {
-  worker.cleanup()
-}, 86400000) // 24 horas
+  process.on('SIGTERM', async () => {
+    console.log('Recebido SIGTERM, parando worker...')
+    await worker.stop()
+    process.exit(0)
+  })
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('📝 Recebido SIGTERM, parando worker...')
-  worker.stop()
-  prisma.$disconnect()
-  process.exit(0)
-})
+  // Iniciar worker
+  worker.start().catch(error => {
+    console.error('Erro ao iniciar worker:', error)
+    process.exit(1)
+  })
+}
 
-process.on('SIGINT', () => {
-  console.log('📝 Recebido SIGINT, parando worker...')
-  worker.stop()
-  prisma.$disconnect()
-  process.exit(0)
-})
-
-// Iniciar o worker
-worker.start()
-
-// Limpeza inicial
-worker.cleanup()
+module.exports = EmailSyncWorker

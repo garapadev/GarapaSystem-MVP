@@ -1,253 +1,319 @@
-#!/usr/bin/env node
-
-const { PrismaClient } = require('@prisma/client')
 const fetch = require('node-fetch')
 const crypto = require('crypto')
+const { PrismaClient } = require('@prisma/client')
 
 const prisma = new PrismaClient()
 
+// Worker para processamento de webhooks
 class WebhookWorker {
   constructor() {
     this.isRunning = false
-    this.interval = null
-    this.processInterval = 5000 // 5 segundos
+    this.processInterval = null
+    this.batchSize = 5 // Processar 5 webhooks por vez
+    this.processIntervalMs = 30 * 1000 // 30 segundos
+    this.maxRetries = 3
+    this.retryDelay = 5000 // 5 segundos
   }
 
-  start() {
-    console.log('🚀 Webhook Worker iniciado')
-    this.isRunning = true
-    this.interval = setInterval(() => {
-      this.processWebhookQueue()
-    }, this.processInterval)
-  }
-
-  stop() {
-    console.log('⏹️ Parando Webhook Worker...')
-    this.isRunning = false
-    if (this.interval) {
-      clearInterval(this.interval)
+  // Iniciar o worker
+  async start() {
+    if (this.isRunning) {
+      console.log('Webhook worker já está rodando')
+      return
     }
+
+    this.isRunning = true
+    console.log('Iniciando webhook worker...')
+
+    // Executar processamento imediatamente
+    await this.processWebhooks()
+
+    // Configurar intervalo de processamento
+    this.processInterval = setInterval(async () => {
+      await this.processWebhooks()
+    }, this.processIntervalMs)
+
+    console.log(`Webhook worker iniciado. Processando a cada ${this.processIntervalMs / 1000} segundos.`)
   }
 
-  async processWebhookQueue() {
+  // Parar o worker
+  async stop() {
+    if (!this.isRunning) {
+      console.log('Webhook worker não está rodando')
+      return
+    }
+
+    this.isRunning = false
+    
+    if (this.processInterval) {
+      clearInterval(this.processInterval)
+      this.processInterval = null
+    }
+
+    await prisma.$disconnect()
+    console.log('Webhook worker parado')
+  }
+
+  // Processar webhooks pendentes
+  async processWebhooks() {
     try {
-      // Buscar webhooks pendentes na fila
-      const pendingWebhooks = await prisma.webhookQueue.findMany({
+      console.log('Verificando webhooks pendentes...')
+      
+      // Buscar webhooks pendentes
+      const pendingWebhooks = await prisma.webhook.findMany({
         where: {
           status: 'PENDING',
-          scheduledFor: {
-            lte: new Date()
+          retries: {
+            lt: this.maxRetries
           }
         },
-        take: 10, // Processar 10 por vez
         orderBy: {
           createdAt: 'asc'
-        }
+        },
+        take: this.batchSize
       })
 
       if (pendingWebhooks.length === 0) {
+        console.log('Nenhum webhook pendente encontrado')
         return
       }
 
-      console.log(`📝 Processando ${pendingWebhooks.length} webhooks pendentes...`)
+      console.log(`Processando ${pendingWebhooks.length} webhooks pendentes`)
 
-      // Processar webhooks em paralelo
-      const promises = pendingWebhooks.map(webhookItem => 
-        this.processWebhookItem(webhookItem)
-      )
+      // Processar webhooks
+      for (const webhook of pendingWebhooks) {
+        await this.processWebhook(webhook)
+        
+        // Pequena pausa entre webhooks
+        await new Promise(resolve => setTimeout(resolve, 100))
+      }
 
-      await Promise.allSettled(promises)
-
+      console.log('Processamento de webhooks concluído')
     } catch (error) {
-      console.error('❌ Erro ao processar fila de webhooks:', error)
+      console.error('Erro no processamento de webhooks:', error)
     }
   }
 
-  async processWebhookItem(webhookItem) {
-    const startTime = Date.now()
-    let success = false
-    let statusCode = 0
-    let errorMessage = ''
-
+  // Processar um webhook específico
+  async processWebhook(webhook) {
     try {
+      console.log(`Processando webhook ${webhook.id} para ${webhook.url}`)
+      
       // Marcar como processando
-      await prisma.webhookQueue.update({
-        where: { id: webhookItem.id },
+      await prisma.webhook.update({
+        where: { id: webhook.id },
         data: { 
           status: 'PROCESSING',
-          processedAt: new Date()
+          lastAttemptAt: new Date()
         }
       })
 
-      // Buscar configurações do webhook
-      const webhook = await prisma.webhook.findUnique({
-        where: { id: webhookItem.webhookId }
-      })
-
-      if (!webhook || !webhook.isActive) {
-        await prisma.webhookQueue.update({
-          where: { id: webhookItem.id },
-          data: { 
-            status: 'CANCELLED',
-            errorMessage: 'Webhook não encontrado ou inativo'
+      // Enviar webhook
+      const result = await this.sendWebhook(webhook)
+      
+      if (result.success) {
+        // Sucesso
+        await prisma.webhook.update({
+          where: { id: webhook.id },
+          data: {
+            status: 'SUCCESS',
+            response: result.response,
+            completedAt: new Date()
           }
         })
-        return
+        
+        console.log(`Webhook ${webhook.id} enviado com sucesso`)
+      } else {
+        // Falha - incrementar tentativas
+        const newRetries = webhook.retries + 1
+        const status = newRetries >= this.maxRetries ? 'FAILED' : 'PENDING'
+        
+        await prisma.webhook.update({
+          where: { id: webhook.id },
+          data: {
+            status,
+            retries: newRetries,
+            lastError: result.error,
+            failedAt: status === 'FAILED' ? new Date() : null
+          }
+        })
+        
+        if (status === 'FAILED') {
+          console.log(`Webhook ${webhook.id} falhou após ${this.maxRetries} tentativas`)
+        } else {
+          console.log(`Webhook ${webhook.id} falhou, tentativa ${newRetries}/${this.maxRetries}`)
+        }
       }
+    } catch (error) {
+      console.error(`Erro ao processar webhook ${webhook.id}:`, error)
+      
+      // Marcar como erro
+      await prisma.webhook.update({
+        where: { id: webhook.id },
+        data: {
+          status: 'FAILED',
+          lastError: error.message,
+          failedAt: new Date()
+        }
+      })
+    }
+  }
 
-      // Preparar headers
+  // Enviar webhook
+  async sendWebhook(webhook) {
+    const startTime = Date.now()
+    
+    try {
+      const payload = JSON.parse(webhook.payload)
+      const payloadString = JSON.stringify(payload)
+      
       const headers = {
         'Content-Type': 'application/json',
-        'User-Agent': 'CRM-Webhook-Worker/1.0',
-        'X-Webhook-Event': webhookItem.event,
-        'X-Webhook-Timestamp': webhookItem.createdAt.toISOString(),
-        ...webhook.headers
+        'User-Agent': 'GarapaSystem-Webhook/1.0',
+        ...JSON.parse(webhook.headers || '{}')
       }
 
-      // Adicionar assinatura HMAC se secret estiver configurado
+      // Adicionar assinatura se secret estiver configurado
       if (webhook.secret) {
-        const signature = this.generateSignature(
-          JSON.stringify(webhookItem.payload), 
-          webhook.secret
-        )
-        headers['X-Webhook-Signature'] = signature
+        const signature = this.generateSignature(payloadString, webhook.secret)
+        headers['X-Webhook-Signature'] = `sha256=${signature}`
       }
 
       // Fazer requisição HTTP
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), webhook.timeout || 30000)
+
       const response = await fetch(webhook.url, {
         method: 'POST',
         headers,
-        body: JSON.stringify(webhookItem.payload),
-        timeout: 30000 // 30 segundos
+        body: payloadString,
+        signal: controller.signal
       })
 
-      statusCode = response.status
-      success = response.ok
+      clearTimeout(timeoutId)
+      const duration = Date.now() - startTime
 
-      if (!response.ok) {
-        errorMessage = `HTTP ${response.status}: ${response.statusText}`
+      let responseData
+      try {
+        responseData = await response.json()
+      } catch {
+        responseData = await response.text()
       }
 
-      // Atualizar status do item da fila
-      await prisma.webhookQueue.update({
-        where: { id: webhookItem.id },
-        data: {
-          status: success ? 'COMPLETED' : 'FAILED',
-          statusCode,
-          errorMessage: errorMessage || null,
-          completedAt: new Date()
-        }
-      })
-
+      return {
+        success: response.ok,
+        status: response.status,
+        response: {
+          status: response.status,
+          data: responseData,
+          duration
+        },
+        duration
+      }
     } catch (error) {
-      errorMessage = error.message || 'Erro desconhecido'
-      console.error(`❌ Erro ao processar webhook ${webhookItem.id}:`, error)
-
-      // Marcar como falhado
-      await prisma.webhookQueue.update({
-        where: { id: webhookItem.id },
-        data: {
-          status: 'FAILED',
-          errorMessage,
-          completedAt: new Date()
-        }
-      })
-    }
-
-    const duration = Date.now() - startTime
-
-    // Atualizar estatísticas do webhook
-    const updateData = {
-      totalCalls: { increment: 1 },
-      lastTriggeredAt: new Date()
-    }
-
-    if (success) {
-      updateData.successfulCalls = { increment: 1 }
-    } else {
-      updateData.failedCalls = { increment: 1 }
-    }
-
-    await prisma.webhook.update({
-      where: { id: webhookItem.webhookId },
-      data: updateData
-    })
-
-    // Criar log do webhook
-    await prisma.webhookLog.create({
-      data: {
-        webhookId: webhookItem.webhookId,
-        event: webhookItem.event,
-        url: webhookItem.webhook?.url || '',
-        payload: webhookItem.payload,
-        statusCode,
-        success,
-        errorMessage: errorMessage || null,
-        duration,
-        triggeredAt: new Date()
+      const duration = Date.now() - startTime
+      
+      return {
+        success: false,
+        status: 0,
+        error: error.message || 'Unknown error',
+        duration
       }
-    })
-
-    console.log(`${success ? '✅' : '❌'} Webhook ${webhookItem.id} processado: ${statusCode} (${duration}ms)`)
+    }
   }
 
+  // Gerar assinatura HMAC
   generateSignature(payload, secret) {
-    const hmac = crypto.createHmac('sha256', secret)
-    hmac.update(payload)
-    return `sha256=${hmac.digest('hex')}`
+    return crypto
+      .createHmac('sha256', secret)
+      .update(payload)
+      .digest('hex')
   }
 
-  async cleanup() {
+  // Limpar webhooks antigos
+  async cleanupOldWebhooks(daysOld = 30) {
     try {
-      // Limpar itens antigos da fila (mais de 7 dias)
-      const sevenDaysAgo = new Date()
-      sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7)
-
-      const deleted = await prisma.webhookQueue.deleteMany({
+      const cutoffDate = new Date()
+      cutoffDate.setDate(cutoffDate.getDate() - daysOld)
+      
+      const result = await prisma.webhook.deleteMany({
         where: {
-          createdAt: {
-            lt: sevenDaysAgo
-          },
-          status: {
-            in: ['COMPLETED', 'FAILED', 'CANCELLED']
-          }
+          OR: [
+            {
+              status: 'SUCCESS',
+              completedAt: {
+                lt: cutoffDate
+              }
+            },
+            {
+              status: 'FAILED',
+              failedAt: {
+                lt: cutoffDate
+              }
+            }
+          ]
         }
       })
-
-      if (deleted.count > 0) {
-        console.log(`🧹 Limpeza: ${deleted.count} itens removidos da fila`)
-      }
+      
+      console.log(`Removidos ${result.count} webhooks antigos`)
     } catch (error) {
-      console.error('❌ Erro na limpeza da fila:', error)
+      console.error('Erro ao limpar webhooks antigos:', error)
+    }
+  }
+
+  // Estatísticas de webhooks
+  async getStats() {
+    try {
+      const stats = await prisma.webhook.groupBy({
+        by: ['status'],
+        _count: {
+          status: true
+        }
+      })
+      
+      const result = {
+        total: 0,
+        pending: 0,
+        processing: 0,
+        success: 0,
+        failed: 0
+      }
+      
+      stats.forEach(stat => {
+        result.total += stat._count.status
+        result[stat.status.toLowerCase()] = stat._count.status
+      })
+      
+      return result
+    } catch (error) {
+      console.error('Erro ao obter estatísticas:', error)
+      return null
     }
   }
 }
 
-// Inicializar worker
-const worker = new WebhookWorker()
+// Inicializar worker se executado diretamente
+if (require.main === module) {
+  const worker = new WebhookWorker()
+  
+  // Graceful shutdown
+  process.on('SIGINT', async () => {
+    console.log('Recebido SIGINT, parando worker...')
+    await worker.stop()
+    process.exit(0)
+  })
 
-// Limpeza a cada hora
-setInterval(() => {
-  worker.cleanup()
-}, 3600000) // 1 hora
+  process.on('SIGTERM', async () => {
+    console.log('Recebido SIGTERM, parando worker...')
+    await worker.stop()
+    process.exit(0)
+  })
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('📝 Recebido SIGTERM, parando worker...')
-  worker.stop()
-  prisma.$disconnect()
-  process.exit(0)
-})
+  // Iniciar worker
+  worker.start().catch(error => {
+    console.error('Erro ao iniciar worker:', error)
+    process.exit(1)
+  })
+}
 
-process.on('SIGINT', () => {
-  console.log('📝 Recebido SIGINT, parando worker...')
-  worker.stop()
-  prisma.$disconnect()
-  process.exit(0)
-})
-
-// Iniciar o worker
-worker.start()
-
-// Limpeza inicial
-worker.cleanup()
+module.exports = WebhookWorker
