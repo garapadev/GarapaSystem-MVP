@@ -1,288 +1,189 @@
-import { PrismaClient } from '@prisma/client'
 import crypto from 'crypto'
 
-const prisma = new PrismaClient()
+// Interface para configuração de webhook
+interface WebhookConfig {
+  url: string
+  secret?: string
+  headers?: Record<string, string>
+  timeout?: number
+}
 
+// Interface para payload do webhook
 interface WebhookPayload {
   event: string
+  data: any
   timestamp: string
-  data: Record<string, any>
+  source: string
 }
 
-interface Webhook {
-  id: string
-  url: string
-  secret?: string | null
-  headers?: Record<string, string> | null
+// Interface para resposta do webhook
+interface WebhookResponse {
+  success: boolean
+  status: number
+  response?: any
+  error?: string
+  duration: number
 }
 
+// Classe para gerenciar webhooks
 export class WebhookService {
-  /**
-   * Dispara webhooks para um evento específico
-   */
-  static async trigger(event: string, data: Record<string, any>) {
-    try {
-      // Buscar todos os webhooks ativos que estão configurados para este evento
-      const webhooks = await prisma.webhook.findMany({
-        where: {
-          isActive: true,
-          events: {
-            has: event
-          }
-        }
-      })
+  private config: WebhookConfig
 
-      if (webhooks.length === 0) {
-        console.log(`Nenhum webhook configurado para o evento: ${event}`)
-        return
-      }
-
-      // Preparar payload
-      const payload: WebhookPayload = {
-        event,
-        timestamp: new Date().toISOString(),
-        data
-      }
-
-      // Disparar webhooks em paralelo
-      const promises = webhooks.map((webhook: Webhook) => 
-        this.sendWebhook(webhook, payload)
-      )
-
-      await Promise.allSettled(promises)
-
-    } catch (error) {
-      console.error('Erro ao disparar webhooks:', error)
+  constructor(config: WebhookConfig) {
+    this.config = {
+      timeout: 30000, // 30 segundos por padrão
+      ...config
     }
   }
 
-  /**
-   * Envia um webhook individual
-   */
-  private static async sendWebhook(webhook: Webhook, payload: WebhookPayload) {
-    const startTime = Date.now()
-    let success = false
-    let statusCode = 0
-    let errorMessage = ''
+  // Gerar assinatura HMAC para o payload
+  private generateSignature(payload: string, secret: string): string {
+    return crypto
+      .createHmac('sha256', secret)
+      .update(payload)
+      .digest('hex')
+  }
 
+  // Enviar webhook
+  async sendWebhook(payload: WebhookPayload): Promise<WebhookResponse> {
+    const startTime = Date.now()
+    
     try {
-      // Preparar headers
+      const payloadString = JSON.stringify(payload)
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
-        'User-Agent': 'CRM-Webhook/1.0',
-        'X-Webhook-Event': payload.event,
-        'X-Webhook-Timestamp': payload.timestamp,
-        ...webhook.headers
+        'User-Agent': 'GarapaSystem-Webhook/1.0',
+        ...this.config.headers
       }
 
-      // Adicionar assinatura HMAC se secret estiver configurado
-      if (webhook.secret) {
-        const signature = this.generateSignature(JSON.stringify(payload), webhook.secret)
-        headers['X-Webhook-Signature'] = signature
+      // Adicionar assinatura se secret estiver configurado
+      if (this.config.secret) {
+        const signature = this.generateSignature(payloadString, this.config.secret)
+        headers['X-Webhook-Signature'] = `sha256=${signature}`
       }
 
       // Fazer requisição HTTP
-      const response = await fetch(webhook.url, {
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), this.config.timeout)
+
+      const response = await fetch(this.config.url, {
         method: 'POST',
         headers,
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(30000) // 30 segundos timeout
+        body: payloadString,
+        signal: controller.signal
       })
 
-      statusCode = response.status
-      success = response.ok
+      clearTimeout(timeoutId)
+      const duration = Date.now() - startTime
 
-      if (!response.ok) {
-        errorMessage = `HTTP ${response.status}: ${response.statusText}`
+      let responseData: any
+      try {
+        responseData = await response.json()
+      } catch {
+        responseData = await response.text()
       }
 
-    } catch (error) {
-      errorMessage = error instanceof Error ? error.message : 'Erro desconhecido'
-      console.error(`Erro ao enviar webhook para ${webhook.url}:`, error)
-    }
-
-    const duration = Date.now() - startTime
-
-    // Atualizar estatísticas do webhook
-    const updateData: any = {
-      totalCalls: { increment: 1 },
-      lastTriggeredAt: new Date()
-    }
-
-    if (success) {
-      updateData.successfulCalls = { increment: 1 }
-    } else {
-      updateData.failedCalls = { increment: 1 }
-    }
-
-    // Executar atualizações em paralelo
-    await Promise.all([
-      // Atualizar estatísticas do webhook
-      prisma.webhook.update({
-        where: { id: webhook.id },
-        data: updateData
-      }),
+      return {
+        success: response.ok,
+        status: response.status,
+        response: responseData,
+        duration
+      }
+    } catch (error: any) {
+      const duration = Date.now() - startTime
       
-      // Criar log do webhook
-      prisma.webhookLog.create({
-        data: {
-          webhookId: webhook.id,
-          event: payload.event,
-          url: webhook.url,
-          payload: payload,
-          statusCode,
-          success,
-          errorMessage: errorMessage || null,
-          duration,
-          triggeredAt: new Date()
-        }
-      })
-    ])
-  }
-
-  /**
-   * Gera assinatura HMAC SHA-256 para validação
-   */
-  private static generateSignature(payload: string, secret: string): string {
-    const hmac = crypto.createHmac('sha256', secret)
-    hmac.update(payload)
-    return `sha256=${hmac.digest('hex')}`
-  }
-
-  /**
-   * Dispara webhook para criação de colaborador
-   */
-  static async triggerEmployeeCreated(employee: any) {
-    await this.trigger('EMPLOYEE_CREATED', {
-      employee: {
-        id: employee.id,
-        employeeNumber: employee.employeeNumber,
-        firstName: employee.firstName,
-        lastName: employee.lastName,
-        email: employee.email,
-        position: employee.position,
-        department: employee.department,
-        isActive: employee.isActive,
-        createdAt: employee.createdAt
+      return {
+        success: false,
+        status: 0,
+        error: error.message || 'Unknown error',
+        duration
       }
-    })
+    }
   }
 
-  /**
-   * Dispara webhook para atualização de colaborador
-   */
-  static async triggerEmployeeUpdated(employee: any, changes: Record<string, any>) {
-    await this.trigger('EMPLOYEE_UPDATED', {
-      employee: {
-        id: employee.id,
-        employeeNumber: employee.employeeNumber,
-        firstName: employee.firstName,
-        lastName: employee.lastName,
-        email: employee.email,
-        position: employee.position,
-        department: employee.department,
-        isActive: employee.isActive,
-        updatedAt: employee.updatedAt
-      },
-      changes
-    })
-  }
+  // Enviar webhook com retry
+  async sendWebhookWithRetry(
+    payload: WebhookPayload,
+    maxRetries: number = 3,
+    retryDelay: number = 1000
+  ): Promise<WebhookResponse> {
+    let lastResponse: WebhookResponse
 
-  /**
-   * Dispara webhook para exclusão de colaborador
-   */
-  static async triggerEmployeeDeleted(employeeId: string, employeeData: any) {
-    await this.trigger('EMPLOYEE_DELETED', {
-      employee: {
-        id: employeeId,
-        ...employeeData,
-        deletedAt: new Date().toISOString()
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      lastResponse = await this.sendWebhook(payload)
+
+      if (lastResponse.success) {
+        return lastResponse
       }
-    })
-  }
 
-  /**
-   * Dispara webhook para criação de tarefa
-   */
-  static async triggerTaskCreated(task: any) {
-    await this.trigger('TASK_CREATED', {
-      task: {
-        id: task.id,
-        title: task.title,
-        description: task.description,
-        status: task.status,
-        priority: task.priority,
-        dueDate: task.dueDate,
-        assigneeId: task.assigneeId,
-        createdById: task.createdById,
-        createdAt: task.createdAt
+      // Se não é a última tentativa, aguardar antes de tentar novamente
+      if (attempt < maxRetries) {
+        await new Promise(resolve => setTimeout(resolve, retryDelay * attempt))
       }
-    })
+    }
+
+    return lastResponse!
   }
 
-  /**
-   * Dispara webhook para atualização de tarefa
-   */
-  static async triggerTaskUpdated(task: any, changes: Record<string, any>) {
-    await this.trigger('TASK_UPDATED', {
-      task: {
-        id: task.id,
-        title: task.title,
-        description: task.description,
-        status: task.status,
-        priority: task.priority,
-        dueDate: task.dueDate,
-        assigneeId: task.assigneeId,
-        updatedAt: task.updatedAt
-      },
-      changes
-    })
+  // Validar assinatura de webhook recebido
+  static validateSignature(
+    payload: string,
+    signature: string,
+    secret: string
+  ): boolean {
+    try {
+      const expectedSignature = crypto
+        .createHmac('sha256', secret)
+        .update(payload)
+        .digest('hex')
+      
+      const receivedSignature = signature.replace('sha256=', '')
+      
+      return crypto.timingSafeEqual(
+        Buffer.from(expectedSignature, 'hex'),
+        Buffer.from(receivedSignature, 'hex')
+      )
+    } catch {
+      return false
+    }
+  }
+}
+
+// Factory para criar instâncias de WebhookService
+export class WebhookServiceFactory {
+  static create(config: WebhookConfig): WebhookService {
+    return new WebhookService(config)
   }
 
-  /**
-   * Dispara webhook para exclusão de tarefa
-   */
-  static async triggerTaskDeleted(taskId: string, taskData: any) {
-    await this.trigger('TASK_DELETED', {
-      task: {
-        id: taskId,
-        ...taskData,
-        deletedAt: new Date().toISOString()
-      }
-    })
+  // Criar múltiplos webhooks para diferentes endpoints
+  static createMultiple(configs: WebhookConfig[]): WebhookService[] {
+    return configs.map(config => new WebhookService(config))
   }
+}
 
-  /**
-   * Dispara webhook para email recebido
-   */
-  static async triggerEmailReceived(email: any) {
-    await this.trigger('EMAIL_RECEIVED', {
-      email: {
-        id: email.id,
-        messageId: email.messageId,
-        subject: email.subject,
-        fromAddress: email.fromAddress,
-        fromName: email.fromName,
-        toAddresses: email.toAddresses,
-        receivedAt: email.receivedAt,
-        emailAccountId: email.emailAccountId
-      }
-    })
-  }
+// Utilitários para webhooks
+export const WebhookUtils = {
+  // Criar payload padrão
+  createPayload(
+    event: string,
+    data: any,
+    source: string = 'GarapaSystem'
+  ): WebhookPayload {
+    return {
+      event,
+      data,
+      timestamp: new Date().toISOString(),
+      source
+    }
+  },
 
-  /**
-   * Dispara webhook para email enviado
-   */
-  static async triggerEmailSent(email: any) {
-    await this.trigger('EMAIL_SENT', {
-      email: {
-        id: email.id,
-        subject: email.subject,
-        fromAddress: email.fromAddress,
-        toAddresses: email.toAddresses,
-        sentAt: new Date().toISOString(),
-        emailAccountId: email.emailAccountId
-      }
-    })
+  // Validar URL de webhook
+  isValidWebhookUrl(url: string): boolean {
+    try {
+      const parsedUrl = new URL(url)
+      return ['http:', 'https:'].includes(parsedUrl.protocol)
+    } catch {
+      return false
+    }
   }
 }
