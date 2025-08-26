@@ -3,197 +3,221 @@
 import { useState } from "react"
 import Link from "next/link"
 import { usePathname } from "next/navigation"
-import { useSession, signOut } from "next-auth/react"
-import { cn } from "@/lib/utils"
-import { Button } from "@/components/ui/button"
+import { signOut } from "next-auth/react"
+import {
+  Sidebar,
+  SidebarContent,
+  SidebarFooter,
+  SidebarGroup,
+  SidebarGroupContent,
+  SidebarGroupLabel,
+  SidebarHeader,
+  SidebarMenu,
+  SidebarMenuButton,
+  SidebarMenuItem,
+  SidebarRail,
+  SidebarTrigger,
+  useSidebar,
+} from "@/components/ui/sidebar"
 import { ScrollArea } from "@/components/ui/scroll-area"
-import { Separator } from "@/components/ui/separator"
-import { 
-  Home, 
-  CheckSquare, 
-  Mail, 
+import { Button } from "@/components/ui/button"
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet"
+import {
+  Home,
+  Users,
+  Building2,
+  Calendar,
+  CheckSquare,
+  Mail,
+  BarChart3,
   Settings,
   LogOut,
-  Menu,
-  X,
-  FileText,
-  Webhook,
-  UserCheck
+  ChevronDown,
+  X
 } from "lucide-react"
 
 const navigation = [
   {
-    name: "Dashboard",
-    href: "/dashboard",
+    title: "Dashboard",
+    url: "/dashboard",
     icon: Home,
   },
   {
-    name: "Clientes",
-    href: "/clients",
-    icon: UserCheck,
+    title: "Clientes",
+    url: "/customers",
+    icon: Users,
   },
   {
-    name: "Tarefas",
-    href: "/tasks",
+    title: "Empresas",
+    url: "/companies",
+    icon: Building2,
+  },
+  {
+    title: "Funcionários",
+    url: "/employees",
+    icon: Users,
+  },
+  {
+    title: "Agenda",
+    url: "/calendar",
+    icon: Calendar,
+  },
+  {
+    title: "Tarefas",
+    url: "/tasks",
     icon: CheckSquare,
   },
   {
-    name: "Webmail",
-    href: "/webmail",
+    title: "Webmail",
+    url: "/webmail",
     icon: Mail,
   },
   {
-    name: "Configurações",
-    icon: Settings,
-    children: [
-      { name: "Colaboradores", href: "/employees" },
-      { name: "Grupos Hierárquicos", href: "/organization/groups" },
-      { name: "Grupos de Permissão", href: "/administration/permission-groups" },
-      { name: "Webhooks", href: "/webhooks" },
-      { name: "Sistema", href: "/settings" },
-    ]
+    title: "Relatórios",
+    url: "/reports",
+    icon: BarChart3,
   },
   {
-    name: "Documentação API",
-    href: "/api-docs",
-    icon: FileText,
+    title: "Configurações",
+    url: "/settings",
+    icon: Settings,
   },
 ]
 
-interface AppSidebarProps {
-  open: boolean
-  setOpen: (open: boolean) => void
-}
-
-export function AppSidebar({ open, setOpen }: AppSidebarProps) {
+export function AppSidebar() {
   const pathname = usePathname()
-  const { data: session } = useSession()
-  const [openGroups, setOpenGroups] = useState<string[]>([])
+  const { isMobile, state, setOpenMobile } = useSidebar()
+  const [expandedGroups, setExpandedGroups] = useState<string[]>(['main'])
 
-  const toggleGroup = (name: string) => {
-    setOpenGroups(prev => 
-      prev.includes(name) 
-        ? prev.filter(item => item !== name)
-        : [...prev, name]
+  const toggleGroup = (groupId: string) => {
+    setExpandedGroups(prev => 
+      prev.includes(groupId) 
+        ? prev.filter(id => id !== groupId)
+        : [...prev, groupId]
     )
   }
 
   const handleSignOut = () => {
-    signOut({ callbackUrl: "/auth/signin" })
+    signOut({ callbackUrl: '/login' })
+  }
+
+  const SidebarContent = () => (
+    <>
+      <SidebarHeader className="border-b px-6 py-4">
+        <div className="flex items-center space-x-2">
+          <div className="w-8 h-8 bg-primary rounded-lg flex items-center justify-center">
+            <span className="text-primary-foreground font-bold text-sm">G</span>
+          </div>
+          <span className="font-semibold text-lg">GarapaSystem</span>
+        </div>
+      </SidebarHeader>
+
+      <ScrollArea className="flex-1">
+        <SidebarContent>
+          <SidebarGroup>
+            <SidebarGroupLabel>Menu Principal</SidebarGroupLabel>
+            <SidebarGroupContent>
+              <SidebarMenu>
+                {navigation.map((item) => {
+                  const isActive = pathname === item.url
+                  return (
+                    <SidebarMenuItem key={item.title}>
+                      <SidebarMenuButton asChild isActive={isActive}>
+                        <Link href={item.url}>
+                          <item.icon className="h-4 w-4" />
+                          <span>{item.title}</span>
+                        </Link>
+                      </SidebarMenuButton>
+                    </SidebarMenuItem>
+                  )
+                })}
+              </SidebarMenu>
+            </SidebarGroupContent>
+          </SidebarGroup>
+        </SidebarContent>
+      </ScrollArea>
+
+      <SidebarFooter className="border-t p-4">
+        <Button 
+          variant="ghost" 
+          className="w-full justify-start" 
+          onClick={handleSignOut}
+        >
+          <LogOut className="h-4 w-4 mr-2" />
+          Sair
+        </Button>
+      </SidebarFooter>
+    </>
+  )
+
+  if (isMobile) {
+    return (
+      <Sheet open={state === "open"} onOpenChange={setOpenMobile}>
+        <SheetContent side="left" className="p-0 w-64">
+          <SheetHeader className="border-b px-6 py-4">
+            <div className="flex items-center justify-between">
+              <SheetTitle className="flex items-center space-x-2">
+                <div className="w-8 h-8 bg-primary rounded-lg flex items-center justify-center">
+                  <span className="text-primary-foreground font-bold text-sm">G</span>
+                </div>
+                <span className="font-semibold text-lg">GarapaSystem</span>
+              </SheetTitle>
+              <Button 
+                variant="ghost" 
+                size="icon" 
+                onClick={() => setOpenMobile(false)}
+              >
+                <X className="h-4 w-4" />
+              </Button>
+            </div>
+          </SheetHeader>
+          
+          <div className="flex flex-col h-full">
+            <ScrollArea className="flex-1">
+              <div className="p-4">
+                <nav className="space-y-2">
+                  {navigation.map((item) => {
+                    const isActive = pathname === item.url
+                    return (
+                      <Link
+                        key={item.title}
+                        href={item.url}
+                        className={`flex items-center space-x-3 px-3 py-2 rounded-lg text-sm transition-colors ${
+                          isActive 
+                            ? 'bg-primary text-primary-foreground' 
+                            : 'text-gray-700 hover:bg-gray-100'
+                        }`}
+                        onClick={() => setOpenMobile(false)}
+                      >
+                        <item.icon className="h-4 w-4" />
+                        <span>{item.title}</span>
+                      </Link>
+                    )
+                  })}
+                </nav>
+              </div>
+            </ScrollArea>
+            
+            <div className="border-t p-4">
+              <Button 
+                variant="ghost" 
+                className="w-full justify-start" 
+                onClick={handleSignOut}
+              >
+                <LogOut className="h-4 w-4 mr-2" />
+                Sair
+              </Button>
+            </div>
+          </div>
+        </SheetContent>
+      </Sheet>
+    )
   }
 
   return (
-    <>
-      {/* Mobile overlay */}
-      {open && (
-        <div 
-          className="fixed inset-0 z-40 bg-black bg-opacity-50 lg:hidden"
-          onClick={() => setOpen(false)}
-        />
-      )}
-      
-      {/* Sidebar */}
-      <div className={cn(
-        "fixed inset-y-0 left-0 z-50 w-64 bg-white border-r transform transition-transform duration-200 ease-in-out lg:translate-x-0 lg:static lg:inset-0",
-        open ? "translate-x-0" : "-translate-x-full"
-      )}>
-        {/* Header */}
-        <div className="flex items-center justify-between p-4 border-b">
-          <h1 className="text-xl font-semibold text-gray-900">CRM MVP</h1>
-          <Button
-            variant="ghost"
-            size="sm"
-            className="lg:hidden"
-            onClick={() => setOpen(false)}
-          >
-            <X className="h-4 w-4" />
-          </Button>
-        </div>
-
-        {/* User info */}
-        {session?.user && (
-          <div className="p-4 border-b">
-            <div className="flex items-center space-x-3">
-              <div className="flex-shrink-0">
-                <div className="w-8 h-8 bg-gray-300 rounded-full flex items-center justify-center">
-                  <span className="text-xs font-medium text-gray-700">
-                    {session.user.name?.charAt(0)?.toUpperCase() || session.user.email?.charAt(0)?.toUpperCase()}
-                  </span>
-                </div>
-              </div>
-              <div className="flex-1 min-w-0">
-                <p className="text-sm font-medium text-gray-900 truncate">
-                  {session.user.name || session.user.email}
-                </p>
-                <p className="text-xs text-gray-500 truncate">
-                  {session.user.email}
-                </p>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Navigation */}
-        <ScrollArea className="flex-1">
-          <nav className="p-4 space-y-2">
-            {navigation.map((item) => {
-              if (item.children) {
-                const isOpen = openGroups.includes(item.name)
-                return (
-                  <div key={item.name}>
-                    <Button
-                      variant="ghost"
-                      className="w-full justify-start"
-                      onClick={() => toggleGroup(item.name)}
-                    >
-                      <item.icon className="mr-2 h-4 w-4" />
-                      {item.name}
-                    </Button>
-                    {isOpen && (
-                      <div className="ml-6 mt-1 space-y-1">
-                        {item.children.map((child) => (
-                          <Link key={child.href} href={child.href}>
-                            <Button
-                              variant={pathname === child.href ? "secondary" : "ghost"}
-                              className="w-full justify-start text-sm"
-                            >
-                              {child.name}
-                            </Button>
-                          </Link>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                )
-              }
-
-              return (
-                <Link key={item.name} href={item.href}>
-                  <Button
-                    variant={pathname === item.href ? "secondary" : "ghost"}
-                    className="w-full justify-start"
-                  >
-                    <item.icon className="mr-2 h-4 w-4" />
-                    {item.name}
-                  </Button>
-                </Link>
-              )
-            })}
-          </nav>
-        </ScrollArea>
-
-        {/* Footer */}
-        <div className="p-4 border-t">
-          <Button
-            variant="ghost"
-            className="w-full justify-start text-red-600 hover:text-red-700 hover:bg-red-50"
-            onClick={handleSignOut}
-          >
-            <LogOut className="mr-2 h-4 w-4" />
-            Sair
-          </Button>
-        </div>
-      </div>
-    </>
+    <Sidebar>
+      <SidebarContent />
+      <SidebarRail />
+    </Sidebar>
   )
 }
